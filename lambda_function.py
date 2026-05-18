@@ -1,7 +1,7 @@
 """AWS Lambda handler for Shopwired webhooks.
 
-Processes ``quote.created`` events and reduces product stock by the quantity
-specified in each quote line item.
+Processes ``order.finalized`` events and reduces product stock by the quantity
+specified in each order line item.
 
 Environment variables
 ---------------------
@@ -9,7 +9,8 @@ SHOPWIRED_API_KEY
     Shopwired REST API key (required).
 SHOPWIRED_WEBHOOK_SECRET
     If set, incoming webhook requests are verified using the
-    ``X-Shopwired-Hmac-Sha256`` header (optional but recommended).
+    ``X-ShopWired-Signature`` header (optional but recommended).
+    Required to respond to the initial webhook verification request.
 """
 
 import hashlib
@@ -23,14 +24,14 @@ from shopwired_client import ShopwiredAPIError, ShopwiredClient
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-EVENT_QUOTE_CREATED = "quote.created"
+EVENT_ORDER_FINALIZED = "order.finalized"
 
 
 def _verify_signature(body: str, signature_header: str, secret: str) -> bool:
     """Return True if the HMAC-SHA256 signature in *signature_header* matches.
 
     Shopwired signs webhook payloads with the webhook secret and sends the
-    hex-encoded digest in the ``X-Shopwired-Hmac-Sha256`` header.
+    hex-encoded digest in the ``X-ShopWired-Signature`` header.
     """
     expected = hmac.new(
         secret.encode(), body.encode(), hashlib.sha256
@@ -68,6 +69,14 @@ def _json_response(status_code: int, body: dict) -> dict:
     }
 
 
+def _text_response(status_code: int, body: str) -> dict:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "text/plain"},
+        "body": body,
+    }
+
+
 def handler(event: dict, context) -> dict:  # noqa: ANN001
     """Lambda entry point.
 
@@ -80,7 +89,13 @@ def handler(event: dict, context) -> dict:  # noqa: ANN001
     webhook_secret = os.environ.get("SHOPWIRED_WEBHOOK_SECRET", "")
     if webhook_secret:
         raw_body = event.get("body") or ""
-        sig = headers.get("x-shopwired-hmac-sha256", "")
+        if isinstance(raw_body, dict):
+            # Body was pre-decoded by the runtime; re-serialise for HMAC.
+            # Note: signature will not match if key ordering differs from the
+            # original bytes sent by Shopwired.  In practice, Lambda Function
+            # URLs always deliver body as a raw string.
+            raw_body = json.dumps(raw_body)
+        sig = headers.get("x-shopwired-signature", "")
         if not sig:
             logger.warning("Missing webhook signature header")
             return _json_response(401, {"error": "Missing signature"})
@@ -94,21 +109,37 @@ def handler(event: dict, context) -> dict:  # noqa: ANN001
         logger.error("Could not parse webhook payload")
         return _json_response(400, {"error": "Invalid or missing JSON body"})
 
+    # ── Handle verification request ──────────────────────────────────────────
+    # Shopwired sends a one-off verification request immediately after a
+    # webhook is created.  The handler must respond with HMAC-SHA256 of
+    # the verificationToken (hex-encoded, plain text).
+    verification_token = payload.get("verificationToken")
+    if verification_token:
+        if not webhook_secret:
+            logger.error("Received verification request but SHOPWIRED_WEBHOOK_SECRET is not set")
+            return _json_response(500, {"error": "Webhook secret not configured"})
+        signed = hmac.new(
+            webhook_secret.encode(), verification_token.encode(), hashlib.sha256
+        ).hexdigest()
+        logger.info("Responding to webhook verification request")
+        return _text_response(200, signed)
+
     # ── Route by event type ──────────────────────────────────────────────────
-    event_type = payload.get("event")
-    if event_type != EVENT_QUOTE_CREATED:
+    event_obj = payload.get("event") or {}
+    event_type = event_obj.get("topic")
+    if event_type != EVENT_ORDER_FINALIZED:
         logger.info("Ignoring event type: %s", event_type)
         return _json_response(200, {"message": f"Event '{event_type}' ignored"})
 
-    # ── Process quote.created ────────────────────────────────────────────────
-    quote = payload.get("quote") or {}
-    quote_id = quote.get("id", "<unknown>")
-    items = quote.get("items") or []
+    # ── Process order.finalized ──────────────────────────────────────────────
+    order = event_obj.get("data", {}).get("object") or {}
+    order_id = event_obj.get("subjectId", "<unknown>")
+    items = order.get("items") or []
 
-    logger.info("Processing quote.created event for quote id=%s (%d items)", quote_id, len(items))
+    logger.info("Processing order.finalized event for order id=%s (%d items)", order_id, len(items))
 
     if not items:
-        return _json_response(200, {"message": "Quote has no items"})
+        return _json_response(200, {"message": "Order has no items"})
 
     # ── Initialise API client ────────────────────────────────────────────────
     api_key = os.environ.get("SHOPWIRED_API_KEY", "")
@@ -126,7 +157,7 @@ def handler(event: dict, context) -> dict:  # noqa: ANN001
         quantity = item.get("quantity", 0)
 
         if not product_id:
-            logger.warning("Skipping item with missing product_id in quote %s", quote_id)
+            logger.warning("Skipping item with missing product_id in order %s", order_id)
             continue
 
         try:
@@ -137,8 +168,8 @@ def handler(event: dict, context) -> dict:  # noqa: ANN001
             client.update_product_stock(product_id, new_stock)
 
             logger.info(
-                "quote=%s product=%s stock %d → %d",
-                quote_id,
+                "order=%s product=%s stock %d → %d",
+                order_id,
                 product_id,
                 current_stock,
                 new_stock,
@@ -153,9 +184,9 @@ def handler(event: dict, context) -> dict:  # noqa: ANN001
 
         except ShopwiredAPIError as exc:
             logger.error(
-                "API error updating product %s for quote %s: %s",
+                "API error updating product %s for order %s: %s",
                 product_id,
-                quote_id,
+                order_id,
                 exc,
             )
             errors.append({"product_id": product_id, "error": str(exc)})

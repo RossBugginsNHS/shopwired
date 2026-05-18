@@ -1,13 +1,15 @@
 # shopwired
 
-AWS Lambda container that listens for [Shopwired](https://www.shopwired.net) webhook events and automatically reduces product stock when a quote is created.
+AWS Lambda container that listens for [Shopwired](https://www.shopwired.net) webhook events and automatically reduces product stock when an order is finalised.
 
 ## How it works
 
-1. Shopwired sends a `quote.created` webhook POST to the Lambda Function URL (or API Gateway endpoint).
-2. The handler parses the quote and iterates over each line item.
-3. For each item it fetches the current `stock_quantity` from the Shopwired Products API and decrements it by the quoted quantity (flooring at 0).
-4. The updated stock is written back via a `PATCH /products/{id}` request.
+1. Shopwired sends an `order.finalized` webhook POST to the Lambda Function URL (or API Gateway endpoint).
+2. The handler optionally verifies the `X-ShopWired-Signature` header, then parses the payload.
+3. On first setup, Shopwired sends a verification request; the handler responds with the HMAC-SHA256 of the `verificationToken`.
+4. For `order.finalized` events the handler iterates over each order line item.
+5. For each item it fetches the current `stock_quantity` from the Shopwired Products API and decrements it by the ordered quantity (flooring at 0).
+6. The updated stock is written back via a `PATCH /products/{id}` request.
 
 ## Project layout
 
@@ -28,7 +30,7 @@ AWS Lambda container that listens for [Shopwired](https://www.shopwired.net) web
 | Variable | Required | Description |
 |---|---|---|
 | `SHOPWIRED_API_KEY` | ✅ | Shopwired REST API key (used for HTTP Basic Auth) |
-| `SHOPWIRED_WEBHOOK_SECRET` | ⬜ | If set, incoming requests are verified using the `X-Shopwired-Hmac-Sha256` HMAC header |
+| `SHOPWIRED_WEBHOOK_SECRET` | ⬜ | If set, incoming requests are verified using the `X-ShopWired-Signature` HMAC header. Required to respond to the initial webhook verification request. |
 
 ## Building and deploying
 
@@ -44,7 +46,9 @@ docker run -p 9000:8080 \
 # Test locally with curl
 curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
   -H "Content-Type: application/json" \
-  -d '{"body":"{\"event\":\"quote.created\",\"quote\":{\"id\":1,\"items\":[{\"product_id\":42,\"quantity\":2}]}}"}'
+  -d '{
+    "body": "{\"timestamp\":\"Tue, 23 Oct 2018 12:08:23 +0000\",\"event\":{\"id\":1,\"topic\":\"order.finalized\",\"subjectId\":42,\"data\":{\"object\":{\"id\":42,\"items\":[{\"product_id\":1,\"quantity\":2}]}}}}"
+  }'
 ```
 
 To deploy to AWS, push the image to Amazon ECR and create (or update) a Lambda function pointing at the image.
@@ -58,22 +62,43 @@ pytest
 
 ## Webhook payload
 
-The handler expects the request body to be JSON in the following shape:
+The handler expects the request body to match the Shopwired webhook spec. A normal event looks like:
 
 ```json
 {
-  "event": "quote.created",
-  "quote": {
-    "id": 123,
-    "items": [
-      { "product_id": 456, "quantity": 2 },
-      { "product_id": 789, "quantity": 1 }
-    ]
+  "timestamp": "Tue, 23 Oct 2018 12:08:23 +0000",
+  "event": {
+    "id": 1,
+    "businessId": 1,
+    "createdAt": "Tue, 23 Oct 2018 12:08:23 +0000",
+    "topic": "order.finalized",
+    "subjectType": "order",
+    "subjectId": 123,
+    "data": {
+      "object": {
+        "id": 123,
+        "items": [
+          { "product_id": 456, "quantity": 2 },
+          { "product_id": 789, "quantity": 1 }
+        ]
+      }
+    }
   }
 }
 ```
 
-Any event type other than `quote.created` is acknowledged with a 200 and ignored.
+The initial verification request (sent by Shopwired when the webhook is first registered) looks like:
+
+```json
+{
+  "timestamp": "Tue, 23 Oct 2018 12:08:23 +0000",
+  "verificationToken": "some-token"
+}
+```
+
+The handler responds with `HMAC-SHA256(verificationToken, webhookSecret)` as a plain-text body.
+
+Any event topic other than `order.finalized` is acknowledged with a 200 and ignored.
 
 ## Response codes
 
