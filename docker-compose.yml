@@ -1,0 +1,25 @@
+# Copy local dev server alongside the Lambda handler so it is available
+# when the container is started with the docker-compose override command.
+services:
+  webhook:
+    build: .
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # Required – your Shopwired REST API key.
+      SHOPWIRED_API_KEY: "${SHOPWIRED_API_KEY:?Set SHOPWIRED_API_KEY in .env or the environment}"
+      # Optional – enables X-ShopWired-Signature verification and the initial
+      # webhook verification handshake.  Strongly recommended in production.
+      SHOPWIRED_WEBHOOK_SECRET: "${SHOPWIRED_WEBHOOK_SECRET:-}"
+      PORT: "8080"
+    # Override BOTH the Lambda RIE entrypoint AND the default CMD so that
+    # Docker runs local_server.py directly.  Without overriding the entrypoint
+    # the Lambda base image's entry script intercepts the command and expects
+    # a handler name (e.g. "lambda_function.handler"), causing exit code 142.
+    entrypoint: ["python3", "/var/task/local_server.py"]
+    command: []
+    volumes:
+      # Mount source files so code changes are reflected without rebuilding.
+      - ./lambda_function.py:/var/task/lambda_function.py:ro
+      - ./shopwired_client.py:/var/task/shopwired_client.py:ro
+      - ./local_server.py:/var/task/local_server.py:ro
